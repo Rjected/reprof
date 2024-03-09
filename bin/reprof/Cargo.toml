@@ -11,3 +11,4 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3.18"
 tikv-jemallocator = { workspace = true, features = ["profiling"] }
+clap = { version = "4.5.2", features = ["derive"] }

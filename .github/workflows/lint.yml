@@ -77,7 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - run: cargo docs --document-private-items
+      - run: cargo doc --workspace --all-features --no-deps --document-private-items
         env:
           # Keep in sync with ./book.yml:jobs.build
           # This should only add `-D warnings`
