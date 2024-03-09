@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/jeprof-firefox",
+    "bin/reprof",
+]
+resolver = "2"
+
+[workspace.lints]
+rust.missing_debug_implementations = "warn"
+rust.missing_docs = "warn"
+rust.unreachable_pub = "warn"
+rustdoc.all = "warn"
+rust.unused_must_use = "deny"
+rust.rust_2018_idioms = "deny"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rjected/reprof"
+exclude = [".github/"]
+
+[workspace.dependencies]
+fxprof-processed-profile = { git = "https://github.com/mstange/samply" }
+jemalloc_pprof = { git = "https://github.com/polarsignals/rust-jemalloc-pprof" }
+tracing = "0.1.4"
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
+tikv-jemallocator = "0.5.4"
+
+[patch."https://github.com/polarsignals/rust-jemalloc-pprof"]
+jemalloc_pprof = { git = "https://github.com/rjected/rust-jemalloc-pprof", branch = "dan/gate-os-better" }

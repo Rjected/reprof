@@ -1,0 +1,13 @@
+[package]
+name = "reprof"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+jemalloc_pprof.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = "0.3.18"
+tikv-jemallocator = { workspace = true, features = ["profiling"] }
