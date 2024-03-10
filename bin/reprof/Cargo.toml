@@ -11,4 +11,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = "0.3.18"
 tikv-jemallocator = { workspace = true, features = ["profiling"] }
+tikv-jemalloc-ctl = { workspace = true }
 clap = { version = "4.5.2", features = ["derive"] }
+fxprof-processed-profile.workspace = true

@@ -4,10 +4,11 @@
 //! visualize jemalloc heap profiles.
 use std::{
     fs::File, io::BufReader, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus,
-    sync::Arc,
+    sync::Arc, time::SystemTime,
 };
 
 use clap::{Args, Parser, Subcommand};
+use fxprof_processed_profile::{Profile, SamplingInterval, Timestamp};
 use jemalloc_pprof::{JemallocProfCtl, PROF_CTL};
 use tikv_jemallocator::Jemalloc;
 use tokio::sync::Mutex;
@@ -37,6 +38,25 @@ async fn main() {
 
     // create a huge vec
     let mut v: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
+    let v2: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
+    let mut v3: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
+
+    v3.extend(v2);
+    v3.extend([1, 2, 3].iter().cloned());
+
+    let _half = alloc_then_dealloc();
+    let v4 = v.clone();
+    let v5 = v.clone();
+    let v6 = v.clone();
+
+    let v4 = v.clone();
+    drop(v5);
+    let v5 = v.clone();
+    drop(v6);
+    let v6 = v.clone();
+
+    _ = alloc_then_dealloc();
+    let mut v7: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
 
     if let Some(file) = dump_jemalloc_profile(ctl.clone()).await {
         // Open and read the profile.
@@ -44,7 +64,71 @@ async fn main() {
         let profile = jemalloc_pprof::internal::parse_jeheap(dump_reader).unwrap();
         println!("{:#?}", profile);
 
-        // Open the profile in firefox.
+        // convert the profile to the ff format
+        let mut ff_profile = Profile::new(
+            "reprof cli startup",
+            SystemTime::now().into(),
+            SamplingInterval::from_millis(1),
+        );
+
+        let curr_pid = std::process::id();
+        let process = ff_profile.add_process("App process", curr_pid, Timestamp::from_millis_since_reference(0.0));
+        let memory_counter = ff_profile.add_counter(process, "jemalloc", "Memory", "Amount of allocated memory");
+
+        // TODO: thread ids later, when we can parse them properly out of the profile
+        //
+        // tid: u32,
+        let tid = 0;
+        let thread_handle = ff_profile.add_thread(process, tid, Timestamp::from_millis_since_reference(0.0), true);
+        ff_profile.set_thread_name(thread_handle, "Main thread");
+
+        for (weighted_stack, something) in profile.iter() {
+            // we'll add this weight to all addrs
+            let weight = weighted_stack.weight;
+
+            // for sample in samples {
+            //     lib_mappings_hierarchy.process_ops(sample.timestamp_mono);
+            //     let UnresolvedSampleOrMarker {
+            //         thread_handle,
+            //         timestamp,
+            //         stack,
+            //         sample_or_marker,
+            //         extra_label_frame,
+            //         ..
+            //     } = sample;
+            //     stack_frame_scratch_buf.clear();
+            //     stacks.convert_back(stack, stack_frame_scratch_buf);
+            //     let frames = stack_converter.convert_stack(
+            //         stack_frame_scratch_buf,
+            //         &lib_mappings_hierarchy,
+            //         extra_label_frame,
+            //     );
+
+            // let stack = vec![
+            //     FrameInfo { frame: Frame::Label(profile.intern_string("Root node")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() },
+            //     FrameInfo { frame: Frame::Label(profile.intern_string("First callee")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() }
+            // ];
+            for addr in &weighted_stack.addrs {
+                // &mut self,
+                // thread: ThreadHandle,
+                // timestamp: Timestamp,
+                // frames: impl Iterator<Item = FrameInfo>,
+                // memory_address: u64,
+                // weight: i32,
+                // ff_profile.add_memory_sample(thread_handle, Timestamp::from_millis_since_reference(0.0), frames, addr, weight);
+
+                // oh, we already have the memory address
+                // ff_profile.add_memory_sample(thread, timestamp, weight)
+            }
+            // ff_profile.add_sample(thread, timestamp, frames, cpu_delta, weight)
+        }
+
+        // we just have a single profile, we're doing this once, just to see the number in the UI
+        let allocated = tikv_jemalloc_ctl::stats::allocated::mib().unwrap();
+        // TODO: this is supposed to refer to a total malloc call, although I'm not sure we have
+        // that from jemalloc dumps
+        let total_mallocs = 1;
+        ff_profile.add_counter_sample(memory_counter, Timestamp::from_millis_since_reference(0.0), allocated.read().unwrap() as f64, total_mallocs);
     }
 
     let opt = Opt::parse();
@@ -104,9 +188,22 @@ async fn main() {
     }
 
     tracing::info!("Goodbye, world deallocating vec of cap {}!", v.capacity());
+    tracing::info!("Goodbye, world deallocating vec of cap {}!", v3.capacity());
+    tracing::info!("Goodbye, world deallocating vec of cap {}!", v4.capacity());
+    tracing::info!("Goodbye, world deallocating vec of cap {}!", v5.capacity());
+    tracing::info!("Goodbye, world deallocating vec of cap {}!", v6.capacity());
+    tracing::info!("Goodbye, world deallocating vec of cap {}!", v7.capacity());
     v.clear();
     deactivate_jemalloc_profiling(ctl.clone()).await;
 }
+
+pub fn alloc_then_dealloc() -> usize {
+    let mut v: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
+    let half = v.capacity() / 2;
+    v.clear();
+    half
+}
+
 
 /// Activate jemalloc profiling.
 pub async fn activate_jemalloc_profiling(ctl: Arc<Mutex<JemallocProfCtl>>) {

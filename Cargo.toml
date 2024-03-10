@@ -27,6 +27,10 @@ jemalloc_pprof = { git = "https://github.com/polarsignals/rust-jemalloc-pprof" }
 tracing = "0.1.4"
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
 tikv-jemallocator = "0.5.4"
+tikv-jemalloc-ctl = "0.5.4"
 
 [patch."https://github.com/polarsignals/rust-jemalloc-pprof"]
 jemalloc_pprof = { git = "https://github.com/rjected/rust-jemalloc-pprof", branch = "dan/gate-os-better" }
+
+[patch."https://github.com/mstange/samply"]
+fxprof-processed-profile = { git = "https://github.com/rjected/samply", branch = "jeprof-samply" }
