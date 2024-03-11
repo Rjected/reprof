@@ -3,16 +3,22 @@
 //! `reprof` is a simple example of how to use the `jemalloc-pprof` crate and firefox profiler to
 //! visualize jemalloc heap profiles.
 use std::{
-    fs::File, io::BufReader, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus,
-    sync::Arc, time::SystemTime,
+    fs::File,
+    io::{BufReader, Read},
+    os::unix::process::ExitStatusExt,
+    path::{Path, PathBuf},
+    process::ExitStatus,
+    sync::Arc,
+    time::SystemTime,
 };
 
 use clap::{Args, Parser, Subcommand};
-use fxprof_processed_profile::{Profile, SamplingInterval, Timestamp};
+use fxprof_processed_profile::{LibraryInfo, Profile, SamplingInterval, Timestamp};
 use jemalloc_pprof::{JemallocProfCtl, PROF_CTL};
 use tikv_jemallocator::Jemalloc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use wholesym::{FramesLookupResult, SymbolManager, SymbolManagerConfig};
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -58,78 +64,138 @@ async fn main() {
     _ = alloc_then_dealloc();
     let mut v7: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
 
-    if let Some(file) = dump_jemalloc_profile(ctl.clone()).await {
-        // Open and read the profile.
-        let dump_reader = BufReader::new(file);
-        let profile = jemalloc_pprof::internal::parse_jeheap(dump_reader).unwrap();
-        println!("{:#?}", profile);
+    let file = dump_jemalloc_profile(ctl.clone()).await.unwrap();
 
-        // convert the profile to the ff format
-        let mut ff_profile = Profile::new(
-            "reprof cli startup",
-            SystemTime::now().into(),
-            SamplingInterval::from_millis(1),
-        );
+    // Open and read the profile.
+    let mut dump_reader = BufReader::new(file);
 
-        let curr_pid = std::process::id();
-        let process = ff_profile.add_process("App process", curr_pid, Timestamp::from_millis_since_reference(0.0));
-        let memory_counter = ff_profile.add_counter(process, "jemalloc", "Memory", "Amount of allocated memory");
+    let profile = jemalloc_pprof::internal::parse_jeheap(dump_reader).unwrap();
+    println!("{:#?}", profile);
 
-        // TODO: thread ids later, when we can parse them properly out of the profile
-        //
-        // tid: u32,
-        let tid = 0;
-        let thread_handle = ff_profile.add_thread(process, tid, Timestamp::from_millis_since_reference(0.0), true);
-        ff_profile.set_thread_name(thread_handle, "Main thread");
+    // convert the profile to the ff format
+    let mut ff_profile = Profile::new(
+        "reprof cli startup",
+        SystemTime::now().into(),
+        SamplingInterval::from_millis(1),
+    );
 
-        for (weighted_stack, something) in profile.iter() {
-            // we'll add this weight to all addrs
-            let weight = weighted_stack.weight;
+    // example of a mapping:
+    //
+    // mappings: [
+    //     Mapping {
+    //         memory_start: 94260335046656,
+    //         memory_end: 94260336416825,
+    //         memory_offset: 0,
+    //         file_offset: 0,
+    //         pathname: "/home/dan/projects/reprof/target/debug/reprof",
+    //         build_id: Some(
+    //             BuildId(
+    //                 [
+    //                     245,
+    //                     154,
+    //                     188,
+    //                     220,
+    //                     169,
+    //                     204,
+    //                     72,
+    //                     36,
+    //                     41,
+    //                     200,
+    //                     105,
+    //                     11,
+    //                     154,
+    //                     93,
+    //                     218,
+    //                     55,
+    //                     77,
+    //                     22,
+    //                     83,
+    //                     87,
+    //                 ],
+    //             ),
+    //         ),
+    //     },
+    //
+    // ok, let's just try to get the same information from the samply code
 
-            // for sample in samples {
-            //     lib_mappings_hierarchy.process_ops(sample.timestamp_mono);
-            //     let UnresolvedSampleOrMarker {
-            //         thread_handle,
-            //         timestamp,
-            //         stack,
-            //         sample_or_marker,
-            //         extra_label_frame,
-            //         ..
-            //     } = sample;
-            //     stack_frame_scratch_buf.clear();
-            //     stacks.convert_back(stack, stack_frame_scratch_buf);
-            //     let frames = stack_converter.convert_stack(
-            //         stack_frame_scratch_buf,
-            //         &lib_mappings_hierarchy,
-            //         extra_label_frame,
-            //     );
+    let curr_pid = std::process::id();
+    let process = ff_profile.add_process(
+        "App process",
+        curr_pid,
+        Timestamp::from_millis_since_reference(0.0),
+    );
+    let memory_counter =
+        ff_profile.add_counter(process, "jemalloc", "Memory", "Amount of allocated memory");
 
-            // let stack = vec![
-            //     FrameInfo { frame: Frame::Label(profile.intern_string("Root node")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() },
-            //     FrameInfo { frame: Frame::Label(profile.intern_string("First callee")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() }
-            // ];
-            for addr in &weighted_stack.addrs {
-                // &mut self,
-                // thread: ThreadHandle,
-                // timestamp: Timestamp,
-                // frames: impl Iterator<Item = FrameInfo>,
-                // memory_address: u64,
-                // weight: i32,
-                // ff_profile.add_memory_sample(thread_handle, Timestamp::from_millis_since_reference(0.0), frames, addr, weight);
+    // TODO: thread ids later, when we can parse them properly out of the profile
+    //
+    // tid: u32,
+    let tid = 0;
+    let thread_handle = ff_profile.add_thread(
+        process,
+        tid,
+        Timestamp::from_millis_since_reference(0.0),
+        true,
+    );
+    ff_profile.set_thread_name(thread_handle, "Main thread");
 
-                // oh, we already have the memory address
-                // ff_profile.add_memory_sample(thread, timestamp, weight)
-            }
-            // ff_profile.add_sample(thread, timestamp, frames, cpu_delta, weight)
+    // ff_profile.add_lib(library)
+    // ff_profile.add_lib_mapping(process, lib, start_avma, end_avma, relative_address_at_start)
+
+    for (weighted_stack, something) in profile.iter() {
+        // we'll add this weight to all addrs
+        let weight = weighted_stack.weight;
+
+        // let me create unresolved stacks from this
+
+        // for sample in samples {
+        //     lib_mappings_hierarchy.process_ops(sample.timestamp_mono);
+        //     let UnresolvedSampleOrMarker {
+        //         thread_handle,
+        //         timestamp,
+        //         stack,
+        //         sample_or_marker,
+        //         extra_label_frame,
+        //         ..
+        //     } = sample;
+        //     stack_frame_scratch_buf.clear();
+        //     stacks.convert_back(stack, stack_frame_scratch_buf);
+        //     let frames = stack_converter.convert_stack(
+        //         stack_frame_scratch_buf,
+        //         &lib_mappings_hierarchy,
+        //         extra_label_frame,
+        //     );
+
+        // let stack = vec![
+        //     FrameInfo { frame: Frame::Label(profile.intern_string("Root node")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() },
+        //     FrameInfo { frame: Frame::Label(profile.intern_string("First callee")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() }
+        // ];
+        for addr in &weighted_stack.addrs {
+            // &mut self,
+            // thread: ThreadHandle,
+            // timestamp: Timestamp,
+            // frames: impl Iterator<Item = FrameInfo>,
+            // memory_address: u64,
+            // weight: i32,
+            // ff_profile.add_memory_sample(thread_handle, Timestamp::from_millis_since_reference(0.0), frames, addr, weight);
+
+            // oh, we already have the memory address
+            // ff_profile.add_memory_sample(thread, timestamp, weight)
         }
-
-        // we just have a single profile, we're doing this once, just to see the number in the UI
-        let allocated = tikv_jemalloc_ctl::stats::allocated::mib().unwrap();
-        // TODO: this is supposed to refer to a total malloc call, although I'm not sure we have
-        // that from jemalloc dumps
-        let total_mallocs = 1;
-        ff_profile.add_counter_sample(memory_counter, Timestamp::from_millis_since_reference(0.0), allocated.read().unwrap() as f64, total_mallocs);
+        // ff_profile.add_sample(thread, timestamp, frames, cpu_delta, weight)
     }
+
+    // we just have a single profile, we're doing this once, just to see the number in the UI
+    let allocated = tikv_jemalloc_ctl::stats::allocated::mib().unwrap();
+    // TODO: this is supposed to refer to a total malloc call, although I'm not sure we have
+    // that from jemalloc dumps
+    let total_mallocs = 1;
+    ff_profile.add_counter_sample(
+        memory_counter,
+        Timestamp::from_millis_since_reference(0.0),
+        allocated.read().unwrap() as f64,
+        total_mallocs,
+    );
 
     let opt = Opt::parse();
     match opt.action {
@@ -141,6 +207,7 @@ async fn main() {
                     std::process::exit(1)
                 }
             };
+
             // let conversion_props = load_args.conversion_props();
             // let converted_temp_file =
             //     attempt_conversion(&load_args.file, &input_file, conversion_props);
@@ -167,6 +234,99 @@ async fn main() {
                 todo!();
                 // profiler::start_profiling_pid(pid, recording_props, conversion_props, server_props);
             } else {
+                // get the symbol map for this binary
+                let symbol_manager = SymbolManager::with_config(SymbolManagerConfig::default());
+                let path = Path::new(&record_args.command[0]);
+
+                tracing::info!(
+                    "Profiling command {command:?} with args {args:?}",
+                    command = record_args.command[0],
+                    args = &record_args.command[1..]
+                );
+
+                let map = symbol_manager
+                    .load_symbol_map_for_binary_at_path(path, None)
+                    .await
+                    .unwrap();
+
+                for (weighted_stack, something) in profile.iter() {
+                    for addr in &weighted_stack.addrs {
+                        tracing::info!("Looking up {:#x} in {path}", addr, path = path.display());
+                        if let Some(address_info) = map.lookup_relative_address(*addr as u32) {
+                            tracing::info!(
+                                "Symbol: {:#x} {name}",
+                                address_info.symbol.address,
+                                name = address_info.symbol.name
+                            );
+                            let frames = match address_info.frames {
+                                FramesLookupResult::Available(frames) => Some(frames),
+                                FramesLookupResult::External(ext_ref) => {
+                                    symbol_manager
+                                        .lookup_external(&map.symbol_file_origin(), &ext_ref)
+                                        .await
+                                }
+                                FramesLookupResult::Unavailable => None,
+                            };
+
+                            if let Some(frames) = frames {
+                                for (i, frame) in frames.into_iter().enumerate() {
+                                    let function = frame.function.unwrap();
+                                    let file = frame.file_path.unwrap().display_path();
+                                    tracing::info!(
+                                        "  #{i:02} {function} at {file}:{:?} with weight {}",
+                                        frame.line_number,
+                                        weighted_stack.weight
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::info!("No symbol for {:#x} was found.", addr);
+                            // convert to u64
+                            let addr: u64 = (*addr).try_into().unwrap();
+                            let offset_res = map.lookup_offset(addr);
+                            if let Some(offset) = offset_res {
+                                tracing::info!("Offset map: {:#?}", offset);
+                            } else {
+                                tracing::info!("No offset for {:#x} was found.", addr);
+                            }
+
+                            let svma_res = map.lookup_svma(addr);
+                            if let Some(svma) = svma_res {
+                                tracing::info!("SVMA map: {:#?}", svma);
+                            } else {
+                                tracing::info!("No SVMA for {:#x} was found.", addr);
+                            }
+                        }
+                    }
+                }
+
+                // println!("Looking up 0xd6f4 in /usr/bin/ls. Results:");
+                // if let Some(address_info) = symbol_map.lookup_relative_address(0xd6f4) {
+                //     println!(
+                //         "Symbol: {:#x} {}",
+                //         address_info.symbol.address, address_info.symbol.name
+                //     );
+                //     let frames = match address_info.frames {
+                //         FramesLookupResult::Available(frames) => Some(frames),
+                //         FramesLookupResult::External(ext_ref) => {
+                //             symbol_manager
+                //                 .lookup_external(&symbol_map.symbol_file_origin(), &ext_ref)
+                //                 .await
+                //         }
+                //         FramesLookupResult::Unavailable => None,
+                //     };
+                //     if let Some(frames) = frames {
+                //         for (i, frame) in frames.into_iter().enumerate() {
+                //             let function = frame.function.unwrap();
+                //             let file = frame.file_path.unwrap().display_path();
+                //             let line = frame.line_number.unwrap();
+                //             println!("  #{i:02} {function} at {file}:{line}");
+                //         }
+                //     }
+                // } else {
+                //     println!("No symbol for 0xd6f4 was found.");
+                // }
+
                 // let exit_status = match profiler::start_recording(
                 //     record_args.command[0].clone(),
                 //     &record_args.command[1..],
@@ -203,7 +363,6 @@ pub fn alloc_then_dealloc() -> usize {
     v.clear();
     half
 }
-
 
 /// Activate jemalloc profiling.
 pub async fn activate_jemalloc_profiling(ctl: Arc<Mutex<JemallocProfCtl>>) {
