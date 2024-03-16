@@ -15,3 +15,4 @@ tikv-jemalloc-ctl = { workspace = true }
 clap = { version = "4.5.2", features = ["derive"] }
 fxprof-processed-profile.workspace = true
 wholesym.workspace = true
+serde_json = "1.0.114"

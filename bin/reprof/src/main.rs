@@ -13,12 +13,12 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand};
-use fxprof_processed_profile::{LibraryInfo, Profile, SamplingInterval, Timestamp};
-use jemalloc_pprof::{JemallocProfCtl, PROF_CTL};
+use fxprof_processed_profile::{LibraryInfo, Profile, SamplingInterval, Timestamp, debugid::DebugId, FrameInfo, Frame, CategoryHandle, FrameFlags};
+use jemalloc_pprof::{JemallocProfCtl, PROF_CTL, internal::Mapping};
 use tikv_jemallocator::Jemalloc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use wholesym::{FramesLookupResult, SymbolManager, SymbolManagerConfig};
+use wholesym::{FramesLookupResult, SymbolManager, SymbolManagerConfig, samply_symbols::DebugIdExt};
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -139,6 +139,80 @@ async fn main() {
     );
     ff_profile.set_thread_name(thread_handle, "Main thread");
 
+    for mapping in &profile.mappings {
+        let Mapping {
+            memory_start,
+            memory_end,
+            memory_offset,
+            file_offset,
+            pathname,
+            build_id,
+        } = mapping;
+
+        // convert buildid to debugid
+        let debug_id = build_id.clone().map(|build_id| {
+            // TODO: why do we have to know / specify little endian?
+            DebugId::from_identifier(&build_id.0, true)
+        }).unwrap();
+
+        let lib_handle = ff_profile.add_lib(LibraryInfo {
+            name: pathname.to_string_lossy().to_string(),
+            debug_name: pathname.to_string_lossy().to_string(),
+            path: pathname.to_string_lossy().to_string(),
+            code_id: None,
+            debug_path: pathname.to_string_lossy().to_string(),
+            debug_id,
+            arch: None,
+            symbol_table: None,
+        });
+
+        ff_profile.add_lib_mapping(process, lib_handle, *memory_start as u64, *memory_end as u64, (*memory_offset).try_into().unwrap());
+
+        // TODO: can we even get the symbol table rn? the mappings are all we have
+        // do we even need it?
+    }
+
+    // profile.add_sample(
+    //     thread,
+    //     Timestamp::from_millis_since_reference(0.0),
+    //     vec![].into_iter(),
+    //     CpuDelta::ZERO,
+    //     1,
+    // );
+    // let libc_handle = profile.add_lib(LibraryInfo {
+    //     name: "libc.so.6".to_string(),
+    //     debug_name: "libc.so.6".to_string(),
+    //     path: "/usr/lib/x86_64-linux-gnu/libc.so.6".to_string(),
+    //     code_id: Some("f0fc29165cbe6088c0e1adf03b0048fbecbc003a".to_string()),
+    //     debug_path: "/usr/lib/x86_64-linux-gnu/libc.so.6".to_string(),
+    //     debug_id: DebugId::from_breakpad("1629FCF0BE5C8860C0E1ADF03B0048FB0").unwrap(),
+    //     arch: None,
+    //     symbol_table: Some(Arc::new(SymbolTable::new(vec![
+    //         Symbol {
+    //             address: 1700001,
+    //             size: Some(180),
+    //             name: "libc_symbol_1".to_string(),
+    //         },
+    //         Symbol {
+    //             address: 674226,
+    //             size: Some(44),
+    //             name: "libc_symbol_3".to_string(),
+    //         },
+    //         Symbol {
+    //             address: 172156,
+    //             size: Some(20),
+    //             name: "libc_symbol_2".to_string(),
+    //         },
+    //     ]))),
+    // });
+    // profile.add_lib_mapping(
+    //     process,
+    //     libc_handle,
+    //     0x00007f76b7e85000,
+    //     0x00007f76b8019000,
+    //     (0x00007f76b7e85000u64 - 0x00007f76b7e5d000u64) as u32,
+    // );
+
     // ff_profile.add_lib(library)
     // ff_profile.add_lib_mapping(process, lib, start_avma, end_avma, relative_address_at_start)
 
@@ -170,7 +244,16 @@ async fn main() {
         //     FrameInfo { frame: Frame::Label(profile.intern_string("Root node")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() },
         //     FrameInfo { frame: Frame::Label(profile.intern_string("First callee")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() }
         // ];
+        let mut frames = vec![];
         for addr in &weighted_stack.addrs {
+            let this_frame = FrameInfo {
+                frame: Frame::ReturnAddress(*addr as u64),
+                category_pair: CategoryHandle::OTHER.into(),
+                flags: FrameFlags::empty(),
+            };
+
+            frames.push(this_frame);
+
             // &mut self,
             // thread: ThreadHandle,
             // timestamp: Timestamp,
@@ -182,6 +265,8 @@ async fn main() {
             // oh, we already have the memory address
             // ff_profile.add_memory_sample(thread, timestamp, weight)
         }
+
+        ff_profile.add_memory_sample(thread_handle, Timestamp::from_millis_since_reference(0.0), frames.into_iter(), None, weight as i32)
         // ff_profile.add_sample(thread, timestamp, frames, cpu_delta, weight)
     }
 
@@ -196,6 +281,10 @@ async fn main() {
         allocated.read().unwrap() as f64,
         total_mallocs,
     );
+
+    // output profile to file
+    let output_file = std::fs::File::create("profile.json").unwrap();
+    serde_json::to_writer(output_file, &ff_profile).unwrap();
 
     let opt = Opt::parse();
     match opt.action {
@@ -249,54 +338,41 @@ async fn main() {
                     .await
                     .unwrap();
 
+                // iter thru symbols
+                let iter_symbols = map.iter_symbols();
+                for symbol in iter_symbols {
+                    // println!("{:#?}", symbol);
+                }
+
                 for (weighted_stack, something) in profile.iter() {
                     for addr in &weighted_stack.addrs {
-                        tracing::info!("Looking up {:#x} in {path}", addr, path = path.display());
-                        if let Some(address_info) = map.lookup_relative_address(*addr as u32) {
-                            tracing::info!(
-                                "Symbol: {:#x} {name}",
-                                address_info.symbol.address,
-                                name = address_info.symbol.name
-                            );
-                            let frames = match address_info.frames {
-                                FramesLookupResult::Available(frames) => Some(frames),
-                                FramesLookupResult::External(ext_ref) => {
-                                    symbol_manager
-                                        .lookup_external(&map.symbol_file_origin(), &ext_ref)
-                                        .await
-                                }
-                                FramesLookupResult::Unavailable => None,
-                            };
+                        // example of how to add samples
 
-                            if let Some(frames) = frames {
-                                for (i, frame) in frames.into_iter().enumerate() {
-                                    let function = frame.function.unwrap();
-                                    let file = frame.file_path.unwrap().display_path();
-                                    tracing::info!(
-                                        "  #{i:02} {function} at {file}:{:?} with weight {}",
-                                        frame.line_number,
-                                        weighted_stack.weight
-                                    );
-                                }
-                            }
-                        } else {
-                            tracing::info!("No symbol for {:#x} was found.", addr);
-                            // convert to u64
-                            let addr: u64 = (*addr).try_into().unwrap();
-                            let offset_res = map.lookup_offset(addr);
-                            if let Some(offset) = offset_res {
-                                tracing::info!("Offset map: {:#?}", offset);
-                            } else {
-                                tracing::info!("No offset for {:#x} was found.", addr);
-                            }
+                        // tracing::info!("Looking up {:#x} in {path}", addr, path = path.display());
+                        // if let Some(address_info) = map.lookup_relative_address(*addr as u32) {
+                        //     tracing::info!(
+                        //         "Symbol: {:#x} {name}",
+                        //         address_info.symbol.address,
+                        //         name = address_info.symbol.name
+                        //     );
+                        // } else {
+                        //     // tracing::info!("No symbol for {:#x} was found.", addr);
+                        //     // convert to u64
+                        //     // let addr: u64 = (*addr).try_into().unwrap();
+                        //     // let offset_res = map.lookup_offset(addr);
+                        //     // if let Some(offset) = offset_res {
+                        //     //     tracing::info!("Offset map: {:#?}", offset);
+                        //     // } else {
+                        //     //     tracing::info!("No offset for {:#x} was found.", addr);
+                        //     // }
 
-                            let svma_res = map.lookup_svma(addr);
-                            if let Some(svma) = svma_res {
-                                tracing::info!("SVMA map: {:#?}", svma);
-                            } else {
-                                tracing::info!("No SVMA for {:#x} was found.", addr);
-                            }
-                        }
+                        //     // let svma_res = map.lookup_svma(addr);
+                        //     // if let Some(svma) = svma_res {
+                        //     //     tracing::info!("SVMA map: {:#?}", svma);
+                        //     // } else {
+                        //     //     tracing::info!("No SVMA for {:#x} was found.", addr);
+                        //     // }
+                        // }
                     }
                 }
 
