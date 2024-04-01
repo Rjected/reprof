@@ -3,22 +3,16 @@
 //! `reprof` is a simple example of how to use the `jemalloc-pprof` crate and firefox profiler to
 //! visualize jemalloc heap profiles.
 use std::{
-    fs::File,
-    io::{BufReader, Read},
-    os::unix::process::ExitStatusExt,
-    path::{Path, PathBuf},
-    process::ExitStatus,
-    sync::Arc,
-    time::SystemTime,
+    collections::{hash_map::Entry, BinaryHeap, HashMap}, fs::File, io::BufReader, path::{Path, PathBuf}, sync::Arc, time::SystemTime
 };
 
 use clap::{Args, Parser, Subcommand};
-use fxprof_processed_profile::{LibraryInfo, Profile, SamplingInterval, Timestamp, debugid::DebugId, FrameInfo, Frame, CategoryHandle, FrameFlags};
+use fxprof_processed_profile::{debugid::DebugId, CategoryHandle, Frame, FrameFlags, FrameInfo, LibraryInfo, Profile, SamplingInterval, Symbol, SymbolTable, Timestamp};
 use jemalloc_pprof::{JemallocProfCtl, PROF_CTL, internal::Mapping};
 use tikv_jemallocator::Jemalloc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use wholesym::{FramesLookupResult, SymbolManager, SymbolManagerConfig, samply_symbols::DebugIdExt};
+use wholesym::{SymbolManager, SymbolManagerConfig, samply_symbols::DebugIdExt};
 
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
@@ -27,12 +21,41 @@ static GLOBAL: Jemalloc = Jemalloc;
 async fn main() {
     // init tracing to stdout with info
     tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .init();
 
     let Some(ctl) = PROF_CTL.as_ref() else {
         tracing::warn!("jemalloc profiling is disabled and cannot be activated");
         return;
+    };
+
+
+    let opt = Opt::parse();
+    let binary_name = match &opt.action {
+        Action::Load(_load_args) => {
+            todo!()
+        }
+
+        #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
+        Action::Record(record_args) => {
+
+            if let Some(pid) = record_args.pid {
+                tracing::info!("Profiling process with pid {pid}");
+                todo!();
+                // profiler::start_profiling_pid(pid, recording_props, conversion_props, server_props);
+            } else {
+                // get the symbol map for this binary
+                let path = Path::new(&record_args.command[0]);
+
+                tracing::info!(
+                    "Profiling command {command:?} with args {args:?}",
+                    command = record_args.command[0],
+                    args = &record_args.command[1..]
+                );
+
+                path
+            }
+        }
     };
 
     // https://profiler.firefox.com/public/ac5355fa6136208d527d908406e90b20e36d0fd9/flame-graph/?ctSummary=native-allocations&globalTrackOrder=0w4&hiddenGlobalTracks=1w3&hiddenLocalTracksByPid=17998-0~17955-0~17977-0&thread=5&timelineType=category&v=10
@@ -42,32 +65,29 @@ async fn main() {
     // Enable jemalloc profiling.
     println!("Hello, world!");
 
-    // create a huge vec
-    let mut v: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
-    let v2: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
-    let mut v3: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
-
-    v3.extend(v2);
-    v3.extend([1, 2, 3].iter().cloned());
-
-    let _half = alloc_then_dealloc();
-    let v4 = v.clone();
-    let v5 = v.clone();
-    let v6 = v.clone();
-
-    let v4 = v.clone();
-    drop(v5);
-    let v5 = v.clone();
-    drop(v6);
-    let v6 = v.clone();
-
-    _ = alloc_then_dealloc();
-    let mut v7: Vec<u64> = Vec::with_capacity(1024 * 1024 * 1024);
+    // create a few vecs
+    let small = alloc_small();
+    let medium = alloc_medium();
+    let large = alloc_large();
+    let complicated = alloc_complicated();
+    let vec: Vec<u8> = Vec::with_capacity(1024 * 1024 * 32);
+    let hashmap: HashMap<u8, u8> = HashMap::with_capacity(32 * 1024 * 1024);
+    let binary_heap: BinaryHeap<u8> = BinaryHeap::with_capacity(32 * 1024 * 1024);
 
     let file = dump_jemalloc_profile(ctl.clone()).await.unwrap();
+    deactivate_jemalloc_profiling(ctl.clone()).await;
+
+    // add capacity of vecs
+    println!("total cap: {:?}", small.capacity());
+    println!("total cap: {:?}", medium.capacity());
+    println!("total cap: {:?}", large.capacity());
+    println!("total cap: {:?}", complicated.capacity());
+    println!("total cap: {:?}", vec.capacity());
+    println!("total cap: {:?}", hashmap.capacity());
+    println!("total cap: {:?}", binary_heap.capacity());
 
     // Open and read the profile.
-    let mut dump_reader = BufReader::new(file);
+    let dump_reader = BufReader::new(file);
 
     let profile = jemalloc_pprof::internal::parse_jeheap(dump_reader).unwrap();
     println!("{:#?}", profile);
@@ -79,45 +99,6 @@ async fn main() {
         SamplingInterval::from_millis(1),
     );
 
-    // example of a mapping:
-    //
-    // mappings: [
-    //     Mapping {
-    //         memory_start: 94260335046656,
-    //         memory_end: 94260336416825,
-    //         memory_offset: 0,
-    //         file_offset: 0,
-    //         pathname: "/home/dan/projects/reprof/target/debug/reprof",
-    //         build_id: Some(
-    //             BuildId(
-    //                 [
-    //                     245,
-    //                     154,
-    //                     188,
-    //                     220,
-    //                     169,
-    //                     204,
-    //                     72,
-    //                     36,
-    //                     41,
-    //                     200,
-    //                     105,
-    //                     11,
-    //                     154,
-    //                     93,
-    //                     218,
-    //                     55,
-    //                     77,
-    //                     22,
-    //                     83,
-    //                     87,
-    //                 ],
-    //             ),
-    //         ),
-    //     },
-    //
-    // ok, let's just try to get the same information from the samply code
-
     let curr_pid = std::process::id();
     let process = ff_profile.add_process(
         "App process",
@@ -126,6 +107,101 @@ async fn main() {
     );
     let memory_counter =
         ff_profile.add_counter(process, "jemalloc", "Memory", "Amount of allocated memory");
+
+    let symbol_manager_config = SymbolManagerConfig::new();
+    tracing::info!(?symbol_manager_config, "printing symbol manager config");
+    let symbol_manager = SymbolManager::with_config(symbol_manager_config);
+
+    // jemalloc prof doesnt work on macos
+    let map = symbol_manager.load_symbol_map_for_binary_at_path(binary_name, None).await.unwrap();
+    tracing::info!("got symbol map for mapping");
+
+    let mut mapped_symbols = HashMap::new();
+
+    for (weighted_stack, _something) in profile.iter() {
+        // we'll add this weight to all addrs
+
+        for addr in &weighted_stack.addrs {
+            for mapping in &profile.mappings {
+                if *addr > mapping.memory_start && *addr < mapping.memory_end {
+                    let rel_addr = addr - mapping.memory_start;
+
+                    // new way: add to memory offset
+                    let new_rel_addr = rel_addr + mapping.memory_offset;
+                    tracing::info!(?mapping, "FOUND ADDRESS IN MAPPING: addr=0x{:x?}, new_rel_addr=0x{:x?}", addr, new_rel_addr);
+                    let symbol_svma = map.lookup_svma(new_rel_addr as u64);
+                    let symbol_relative = map.lookup_relative_address(new_rel_addr as u32);
+                    // tracing::info!("CHECKING, symbol_svma={:#?}, symbol_relative={:#?}", symbol_svma, symbol_relative);
+
+                    let symbol_info = symbol_relative.or(symbol_svma);
+                    if let Some(info) = symbol_info {
+                        let new_symbol = Symbol {
+                            address: info.symbol.address,
+                            size: info.symbol.size,
+                            name: info.symbol.name,
+                        };
+
+                        tracing::info!("GOT ONE, in_symbol_addr=0x{:x?}, current_addr=0x{:x?}", new_symbol.address, new_rel_addr);
+                        match mapped_symbols.entry(mapping.memory_offset) {
+                            Entry::Vacant(vacant) => {
+                                vacant.insert(vec![new_symbol]);
+                            }
+                            Entry::Occupied(mut occupied) => {
+                                occupied.get_mut().push(new_symbol);
+                            }
+                        }
+                    }
+                    // TODO: else panic
+                }
+            }
+        }
+    }
+
+    tracing::info!(?mapped_symbols, "CONSTRUCTED MAPPED SYMBOLS");
+
+    for mapping in &profile.mappings {
+        println!("ADDING THIS MAPPING: {mapping:?}");
+        let Mapping {
+            memory_start,
+            memory_end,
+            memory_offset,
+            file_offset: _,
+            pathname,
+            build_id,
+        } = mapping;
+
+        // convert buildid to debugid
+        let debug_id = build_id.clone().map(|build_id| {
+            // TODO: why do we have to know / specify little endian?
+            DebugId::from_identifier(&build_id.0, true)
+        }).unwrap();
+
+        // TODO: we're pre-symbolicating here, but we should create the wholesym symbol manager
+        // and run the server just like how samply does it
+        //
+        // but need to test that out
+        let symbol_table_for_map = mapped_symbols.get(&mapping.memory_offset).cloned().map(SymbolTable::new).map(Arc::new);
+        let library_info = LibraryInfo {
+            name: pathname.to_string_lossy().to_string(),
+            debug_name: pathname.to_string_lossy().to_string(),
+            path: pathname.to_string_lossy().to_string(),
+            code_id: None,
+            debug_path: pathname.to_string_lossy().to_string(),
+            debug_id,
+            arch: None,
+            symbol_table: symbol_table_for_map.clone(),
+        };
+
+        println!("ADDING LIBRARY INFO: {:#?}", library_info);
+
+        let lib_handle = ff_profile.add_lib(library_info);
+
+        let offset = (*memory_offset).try_into().unwrap();
+        ff_profile.add_lib_mapping(process, lib_handle, *memory_start as u64, *memory_end as u64, offset);
+
+        // TODO: can we even get the symbol table rn? the mappings are all we have
+        // do we even need it?
+    }
 
     // TODO: thread ids later, when we can parse them properly out of the profile
     //
@@ -139,134 +215,61 @@ async fn main() {
     );
     ff_profile.set_thread_name(thread_handle, "Main thread");
 
-    for mapping in &profile.mappings {
-        let Mapping {
-            memory_start,
-            memory_end,
-            memory_offset,
-            file_offset,
-            pathname,
-            build_id,
-        } = mapping;
-
-        // convert buildid to debugid
-        let debug_id = build_id.clone().map(|build_id| {
-            // TODO: why do we have to know / specify little endian?
-            DebugId::from_identifier(&build_id.0, true)
-        }).unwrap();
-
-        let lib_handle = ff_profile.add_lib(LibraryInfo {
-            name: pathname.to_string_lossy().to_string(),
-            debug_name: pathname.to_string_lossy().to_string(),
-            path: pathname.to_string_lossy().to_string(),
-            code_id: None,
-            debug_path: pathname.to_string_lossy().to_string(),
-            debug_id,
-            arch: None,
-            symbol_table: None,
-        });
-
-        ff_profile.add_lib_mapping(process, lib_handle, *memory_start as u64, *memory_end as u64, (*memory_offset).try_into().unwrap());
-
-        // TODO: can we even get the symbol table rn? the mappings are all we have
-        // do we even need it?
-    }
-
-    // profile.add_sample(
-    //     thread,
-    //     Timestamp::from_millis_since_reference(0.0),
-    //     vec![].into_iter(),
-    //     CpuDelta::ZERO,
-    //     1,
-    // );
-    // let libc_handle = profile.add_lib(LibraryInfo {
-    //     name: "libc.so.6".to_string(),
-    //     debug_name: "libc.so.6".to_string(),
-    //     path: "/usr/lib/x86_64-linux-gnu/libc.so.6".to_string(),
-    //     code_id: Some("f0fc29165cbe6088c0e1adf03b0048fbecbc003a".to_string()),
-    //     debug_path: "/usr/lib/x86_64-linux-gnu/libc.so.6".to_string(),
-    //     debug_id: DebugId::from_breakpad("1629FCF0BE5C8860C0E1ADF03B0048FB0").unwrap(),
-    //     arch: None,
-    //     symbol_table: Some(Arc::new(SymbolTable::new(vec![
-    //         Symbol {
-    //             address: 1700001,
-    //             size: Some(180),
-    //             name: "libc_symbol_1".to_string(),
-    //         },
-    //         Symbol {
-    //             address: 674226,
-    //             size: Some(44),
-    //             name: "libc_symbol_3".to_string(),
-    //         },
-    //         Symbol {
-    //             address: 172156,
-    //             size: Some(20),
-    //             name: "libc_symbol_2".to_string(),
-    //         },
-    //     ]))),
-    // });
-    // profile.add_lib_mapping(
-    //     process,
-    //     libc_handle,
-    //     0x00007f76b7e85000,
-    //     0x00007f76b8019000,
-    //     (0x00007f76b7e85000u64 - 0x00007f76b7e5d000u64) as u32,
-    // );
-
-    // ff_profile.add_lib(library)
-    // ff_profile.add_lib_mapping(process, lib, start_avma, end_avma, relative_address_at_start)
-
-    for (weighted_stack, something) in profile.iter() {
+    for (weighted_stack, _something) in profile.iter() {
         // we'll add this weight to all addrs
         let weight = weighted_stack.weight;
 
-        // let me create unresolved stacks from this
+        let symbol_manager_config = SymbolManagerConfig::new();
+        tracing::info!(?symbol_manager_config, "printing symbol manager config");
+        let symbol_manager = SymbolManager::with_config(symbol_manager_config);
 
-        // for sample in samples {
-        //     lib_mappings_hierarchy.process_ops(sample.timestamp_mono);
-        //     let UnresolvedSampleOrMarker {
-        //         thread_handle,
-        //         timestamp,
-        //         stack,
-        //         sample_or_marker,
-        //         extra_label_frame,
-        //         ..
-        //     } = sample;
-        //     stack_frame_scratch_buf.clear();
-        //     stacks.convert_back(stack, stack_frame_scratch_buf);
-        //     let frames = stack_converter.convert_stack(
-        //         stack_frame_scratch_buf,
-        //         &lib_mappings_hierarchy,
-        //         extra_label_frame,
-        //     );
+        // jemalloc prof doesnt work on macos
+        let map = symbol_manager.load_symbol_map_for_binary_at_path(binary_name, None).await.unwrap();
 
-        // let stack = vec![
-        //     FrameInfo { frame: Frame::Label(profile.intern_string("Root node")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() },
-        //     FrameInfo { frame: Frame::Label(profile.intern_string("First callee")), category_pair: CategoryHandle::OTHER.into(), flags: FrameFlags::empty() }
-        // ];
         let mut frames = vec![];
-        for addr in &weighted_stack.addrs {
-            let this_frame = FrameInfo {
-                frame: Frame::ReturnAddress(*addr as u64),
-                category_pair: CategoryHandle::OTHER.into(),
-                flags: FrameFlags::empty(),
-            };
+        'addrs: for addr in &weighted_stack.addrs {
+            println!("considering addr: {:?}", addr);
+            for mapping in &profile.mappings {
+                if *addr > mapping.memory_start && *addr < mapping.memory_end {
 
-            frames.push(this_frame);
+                    let rel_addr = addr - mapping.memory_start;
+                    // new way: add to memory offset
+                    let new_rel_addr = rel_addr + mapping.memory_offset;
+                    let symbol_svma = map.lookup_svma(new_rel_addr as u64);
+                    let symbol_relative = map.lookup_relative_address(new_rel_addr as u32);
 
-            // &mut self,
-            // thread: ThreadHandle,
-            // timestamp: Timestamp,
-            // frames: impl Iterator<Item = FrameInfo>,
-            // memory_address: u64,
-            // weight: i32,
-            // ff_profile.add_memory_sample(thread_handle, Timestamp::from_millis_since_reference(0.0), frames, addr, weight);
+                    let symbol_info = symbol_relative.or(symbol_svma);
 
-            // oh, we already have the memory address
-            // ff_profile.add_memory_sample(thread, timestamp, weight)
+                    if let Some(info) = &symbol_info {
+
+                        let new_symbol = Symbol {
+                            address: new_rel_addr as u32,
+                            // TODO: idk what this is really
+                            // size: info.symbol.size,
+                            // this fucks up the binary search for some reason
+                            size: None,
+                            name: info.symbol.name.clone(),
+                        };
+                        let return_addr_frame = Frame::ReturnAddress(*addr as u64);
+                        println!("symbol={:?}, in_symbol_addr=0x{:?}, current_addr=0x{:?}, addr={:?}", new_symbol, new_symbol.address, new_rel_addr, return_addr_frame);
+                    }
+
+                    let this_frame = FrameInfo {
+                        frame: Frame::ReturnAddress(*addr as u64),
+                        category_pair: CategoryHandle::OTHER.into(),
+                        flags: FrameFlags::empty(),
+                    };
+
+                    println!("pushing frame with symbol ({:?}): {:?}", symbol_info.is_some(), this_frame);
+                    frames.push(this_frame);
+                    continue 'addrs
+                }
+            }
         }
 
-        ff_profile.add_memory_sample(thread_handle, Timestamp::from_millis_since_reference(0.0), frames.into_iter(), None, weight as i32)
+        tracing::info!("PUSHING FRAMES frame={:#?}", frames);
+        ff_profile.add_memory_sample(thread_handle, Timestamp::from_millis_since_reference(0.0), frames.into_iter(), None, weight as i32);
+
         // ff_profile.add_sample(thread, timestamp, frames, cpu_delta, weight)
     }
 
@@ -282,155 +285,41 @@ async fn main() {
         total_mallocs,
     );
 
+    // println the profile first
+    println!("PROFILE: {ff_profile:#?}");
+
     // output profile to file
-    let output_file = std::fs::File::create("profile.json").unwrap();
-    serde_json::to_writer(output_file, &ff_profile).unwrap();
+    let mut output_file = std::fs::File::create("profile.json").unwrap();
+    serde_json::to_writer(&mut output_file, &ff_profile).unwrap();
+}
 
-    let opt = Opt::parse();
-    match opt.action {
-        Action::Load(load_args) => {
-            let input_file = match File::open(&load_args.file) {
-                Ok(file) => file,
-                Err(err) => {
-                    eprintln!("Could not open file {:?}: {}", load_args.file, err);
-                    std::process::exit(1)
-                }
-            };
+pub fn alloc_large() -> Vec<u8> {
+    let large = Vec::with_capacity(8 * 1024 * 1024);
+    println!("large capacity: {}", large.capacity());
+    large
+}
 
-            // let conversion_props = load_args.conversion_props();
-            // let converted_temp_file =
-            //     attempt_conversion(&load_args.file, &input_file, conversion_props);
-            // let filename = match &converted_temp_file {
-            //     Some(temp_file) => temp_file.path(),
-            //     None => &load_args.file,
-            // };
-            // start_server_main(filename, load_args.server_args.server_props());
-        }
+pub fn alloc_complicated() -> Vec<u8> {
+    let mut complicated = Vec::with_capacity(16 * 1024 * 1024);
+    let small = alloc_small();
+    let medium = alloc_medium();
+    let large = alloc_large();
+    complicated.extend(small);
+    complicated.extend(medium);
+    complicated.extend(large);
+    complicated
+}
 
-        #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
-        Action::Record(record_args) => {
-            // let server_props = if record_args.save_only {
-            //     None
-            // } else {
-            //     Some(record_args.server_args.server_props())
-            // };
+pub fn alloc_medium() -> Vec<u8> {
+    let medium = Vec::with_capacity(4 * 1024 * 1024);
+    println!("medium capacity: {}", medium.capacity());
+    medium
+}
 
-            // let recording_props = record_args.recording_props();
-            // let conversion_props = record_args.conversion_props();
-
-            if let Some(pid) = record_args.pid {
-                tracing::info!("Profiling process with pid {pid}");
-                todo!();
-                // profiler::start_profiling_pid(pid, recording_props, conversion_props, server_props);
-            } else {
-                // get the symbol map for this binary
-                let symbol_manager = SymbolManager::with_config(SymbolManagerConfig::default());
-                let path = Path::new(&record_args.command[0]);
-
-                tracing::info!(
-                    "Profiling command {command:?} with args {args:?}",
-                    command = record_args.command[0],
-                    args = &record_args.command[1..]
-                );
-
-                let map = symbol_manager
-                    .load_symbol_map_for_binary_at_path(path, None)
-                    .await
-                    .unwrap();
-
-                // iter thru symbols
-                let iter_symbols = map.iter_symbols();
-                for symbol in iter_symbols {
-                    // println!("{:#?}", symbol);
-                }
-
-                for (weighted_stack, something) in profile.iter() {
-                    for addr in &weighted_stack.addrs {
-                        // example of how to add samples
-
-                        // tracing::info!("Looking up {:#x} in {path}", addr, path = path.display());
-                        // if let Some(address_info) = map.lookup_relative_address(*addr as u32) {
-                        //     tracing::info!(
-                        //         "Symbol: {:#x} {name}",
-                        //         address_info.symbol.address,
-                        //         name = address_info.symbol.name
-                        //     );
-                        // } else {
-                        //     // tracing::info!("No symbol for {:#x} was found.", addr);
-                        //     // convert to u64
-                        //     // let addr: u64 = (*addr).try_into().unwrap();
-                        //     // let offset_res = map.lookup_offset(addr);
-                        //     // if let Some(offset) = offset_res {
-                        //     //     tracing::info!("Offset map: {:#?}", offset);
-                        //     // } else {
-                        //     //     tracing::info!("No offset for {:#x} was found.", addr);
-                        //     // }
-
-                        //     // let svma_res = map.lookup_svma(addr);
-                        //     // if let Some(svma) = svma_res {
-                        //     //     tracing::info!("SVMA map: {:#?}", svma);
-                        //     // } else {
-                        //     //     tracing::info!("No SVMA for {:#x} was found.", addr);
-                        //     // }
-                        // }
-                    }
-                }
-
-                // println!("Looking up 0xd6f4 in /usr/bin/ls. Results:");
-                // if let Some(address_info) = symbol_map.lookup_relative_address(0xd6f4) {
-                //     println!(
-                //         "Symbol: {:#x} {}",
-                //         address_info.symbol.address, address_info.symbol.name
-                //     );
-                //     let frames = match address_info.frames {
-                //         FramesLookupResult::Available(frames) => Some(frames),
-                //         FramesLookupResult::External(ext_ref) => {
-                //             symbol_manager
-                //                 .lookup_external(&symbol_map.symbol_file_origin(), &ext_ref)
-                //                 .await
-                //         }
-                //         FramesLookupResult::Unavailable => None,
-                //     };
-                //     if let Some(frames) = frames {
-                //         for (i, frame) in frames.into_iter().enumerate() {
-                //             let function = frame.function.unwrap();
-                //             let file = frame.file_path.unwrap().display_path();
-                //             let line = frame.line_number.unwrap();
-                //             println!("  #{i:02} {function} at {file}:{line}");
-                //         }
-                //     }
-                // } else {
-                //     println!("No symbol for 0xd6f4 was found.");
-                // }
-
-                // let exit_status = match profiler::start_recording(
-                //     record_args.command[0].clone(),
-                //     &record_args.command[1..],
-                //     record_args.iteration_count,
-                //     recording_props,
-                //     conversion_props,
-                //     server_props,
-                // ) {
-                //     Ok(exit_status) => exit_status,
-                //     Err(err) => {
-                //         eprintln!("Encountered an error during profiling: {err:?}");
-                //         std::process::exit(1);
-                //     }
-                // };
-                let exit_status = ExitStatus::from_raw(0);
-                std::process::exit(exit_status.code().unwrap_or(0));
-            }
-        }
-    }
-
-    tracing::info!("Goodbye, world deallocating vec of cap {}!", v.capacity());
-    tracing::info!("Goodbye, world deallocating vec of cap {}!", v3.capacity());
-    tracing::info!("Goodbye, world deallocating vec of cap {}!", v4.capacity());
-    tracing::info!("Goodbye, world deallocating vec of cap {}!", v5.capacity());
-    tracing::info!("Goodbye, world deallocating vec of cap {}!", v6.capacity());
-    tracing::info!("Goodbye, world deallocating vec of cap {}!", v7.capacity());
-    v.clear();
-    deactivate_jemalloc_profiling(ctl.clone()).await;
+pub fn alloc_small() -> Vec<u8> {
+    let small = Vec::with_capacity(2 * 1024 * 1024);
+    println!("small capacity: {}", small.capacity());
+    small
 }
 
 pub fn alloc_then_dealloc() -> usize {
