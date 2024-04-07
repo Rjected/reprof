@@ -453,7 +453,7 @@ struct AnalyzeArgs {
     command: Vec<std::ffi::OsString>,
 
     /// Specify the heap files to load.
-    #[arg(short, long, allow_hyphen_values = true, trailing_var_arg = true)]
+    #[arg(long, allow_hyphen_values = true, trailing_var_arg = true)]
     heap_files: Vec<PathBuf>,
 }
 
