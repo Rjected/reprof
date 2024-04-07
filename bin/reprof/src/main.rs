@@ -45,7 +45,8 @@ async fn main() {
 
         #[cfg(any(target_os = "android", target_os = "macos", target_os = "linux"))]
         Action::Analyze(analyze_args) => {
-            let path = Path::new(&analyze_args.command[0]);
+            let cmd = analyze_args.command.first().expect("No command specified");
+            let path = Path::new(&cmd);
             let heap_file_name = analyze_args
                 .heap_files
                 .first()
@@ -448,13 +449,13 @@ struct AnalyzeArgs {
     #[command(flatten)]
     server_args: ServerArgs,
 
+    /// Specify the heap files to load.
+    #[arg(long)]
+    heap_files: Vec<PathBuf>,
+
     /// Profile the execution of this command.
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     command: Vec<std::ffi::OsString>,
-
-    /// Specify the heap files to load.
-    #[arg(long, allow_hyphen_values = true, trailing_var_arg = true)]
-    heap_files: Vec<PathBuf>,
 }
 
 // TODO: actually achieve this
